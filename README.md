@@ -30,8 +30,12 @@ Run locally: `npm install && npm run dev` → http://localhost:3000
 ## Notes / honest caveats
 
 - Paper trading only. Not affiliated with Polymarket.
-- "Price to beat" uses Polymarket's value if the API exposes it, otherwise the Chainlink tick at window
-  start, otherwise the Binance 1-minute candle open (marked ≈). If you open the app mid-window, it may be approximate.
+- **Price to beat** is looked up in this order: (1) Polymarket's own open price for the window, fetched
+  server-side via `/api/ptb` (the same number Polymarket's page shows); (2) Gamma metadata; (3) the Chainlink
+  tick at the window start; (4) Binance candle open corrected by the live Binance-vs-Chainlink gap. Anything
+  other than (1)/(2) is labelled "≈" under the price. If `/api/ptb` is ever blocked upstream, you'll see (3)/(4).
+- **Chart**: rolling 60-second window with the live price pinned at the right edge; the head eases toward each
+  new tick so it glides. Use the top-left button to switch light/dark.
 - The Binance feed is faster than Chainlink and can differ by a few dollars; settlement uses Polymarket's result.
 - Trading fees are ignored by default. Set `TAKER_FEE_RATE` in `lib/config.js` to simulate one.
 - Polymarket's public endpoints can change; if something stops updating, check `lib/config.js`.

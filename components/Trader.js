@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerClock, syncedNow } from "../lib/clock";
 import { usePriceFeeds } from "../lib/feeds";
 import { usePolyBook } from "../lib/book";
-import { fetchBinanceOpen, fetchEventBySlug, parseMarket, winnerOf } from "../lib/polymarket";
+import { fetchBinanceOpen, fetchEventBySlug, fetchOpenPrice, parseMarket, winnerOf } from "../lib/polymarket";
 import { useStore } from "../lib/store";
 import { walkBuy, walkSell } from "../lib/engine";
 import { FILL_DELAY_MS, DEFAULT_BALANCE, TAKER_FEE_RATE, WINDOW_SEC } from "../lib/config";
@@ -13,6 +13,7 @@ import Ticket from "./Ticket";
 import Drawer from "./Drawer";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const money = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 export default function Trader() {
   const [mounted, setMounted] = useState(false);
@@ -34,6 +35,14 @@ function App() {
   const [toast, setToast] = useState(null);
   const [market, setMarket] = useState(null);
   const [ptb, setPtb] = useState(null);
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem("polypaper-theme") || "dark"; } catch { return "dark"; }
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem("polypaper-theme", theme); } catch {}
+  }, [theme]);
 
   const balance = useStore((s) => s.balance);
   const startBalance = useStore((s) => s.startBalance);
@@ -94,44 +103,61 @@ function App() {
   const cur = lastTick ? lastTick[1] : null;
 
   // ---------- price to beat ----------
+  // 1) Polymarket's own open price (exact)  2) Chainlink tick at the window start
+  // 3) Binance candle open corrected by the live Binance↔Chainlink basis (approximate)
   useEffect(() => {
     setPtb(null);
     if (!market) return;
     let dead = false;
     let timer;
     let attempt = 0;
-    const near = (arr) => {
+    const nearTick = (arr) => {
       let best = null;
-      let bd = 3500;
+      let bd = 2500;
       for (let i = arr.length - 1; i >= 0; i--) {
         const d = Math.abs(arr[i][0] - startMs);
         if (d < bd) { bd = d; best = arr[i][1]; }
-        if (arr[i][0] < startMs - 3500) break;
+        if (arr[i][0] < startMs - 2500) break;
       }
       return best;
     };
+    const put = (p) => setPtb((prev) => (prev && prev.exact ? prev : p));
+
     const run = async () => {
-      if (market.ptb != null) { setPtb({ v: market.ptb, src: "Polymarket" }); return true; }
-      let v = null;
-      let src = "";
-      if (mode !== "binance") { v = near(cl.current); src = "Chainlink"; }
-      if (v == null && mode !== "chainlink") { v = near(bin.current); src = "Binance"; }
-      if (v == null && syncedNow() - startMs > 4000 && attempt % 5 === 0) {
-        v = await fetchBinanceOpen(startMs);
-        src = "Binance candle open (≈)";
+      if (attempt < 4 || attempt % 8 === 0) {
+        const ex = await fetchOpenPrice(ws);
+        if (dead) return true;
+        if (ex != null) { setPtb({ v: ex, src: "Polymarket", exact: true }); return true; }
       }
-      attempt++;
-      if (v != null) { if (!dead) setPtb({ v, src }); return true; }
+      if (market.ptb != null) { setPtb({ v: market.ptb, src: "Polymarket", exact: true }); return true; }
+
+      const v = nearTick(cl.current);
+      if (v != null) { put({ v, src: "≈ Chainlink tick at window start", exact: false }); return false; }
+
+      if (syncedNow() - startMs > 3000 && (attempt === 2 || attempt % 8 === 4)) {
+        const open = await fetchBinanceOpen(startMs);
+        if (dead) return true;
+        if (open != null) {
+          const c = cl.current;
+          const b = bin.current;
+          let adj = open;
+          if (c.length && b.length && Math.abs(c[c.length - 1][0] - b[b.length - 1][0]) < 3000) {
+            adj = open + (c[c.length - 1][1] - b[b.length - 1][1]); // remove the exchange basis
+          }
+          put({ v: adj, src: "≈ estimate (Binance open, Chainlink-adjusted)", exact: false });
+        }
+      }
       return false;
     };
     const loop = async () => {
       if (dead) return;
-      const ok = await run();
-      if (!ok && !dead) timer = setTimeout(loop, 700);
+      const done = await run();
+      attempt++;
+      if (!done && !dead && attempt < 60) timer = setTimeout(loop, attempt < 6 ? 800 : 4000);
     };
     loop();
     return () => { dead = true; clearTimeout(timer); };
-  }, [market, mode, startMs, bin, cl]);
+  }, [market, ws, startMs, bin, cl]);
 
   // ---------- order execution ----------
   const ctx = useRef({});
@@ -210,8 +236,17 @@ function App() {
   return (
     <div className="app">
       <header className="top">
-        <div className="brand">
-          <span className="logo">◆</span> PolyPaper <span className="tag">PAPER</span>
+        <div className="lefttop">
+          <button
+            className="pill theme"
+            aria-label="Toggle light / dark theme"
+            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+          >
+            {theme === "dark" ? "☀ Light" : "☾ Dark"}
+          </button>
+          <div className="brand">
+            <span className="logo">◆</span> PolyPaper <span className="tag">PAPER</span>
+          </div>
         </div>
         <div className="feeds">
           <span><Dot ok={status.cl === "live"} /> Chainlink</span>
@@ -237,9 +272,12 @@ function App() {
       <main className="grid">
         <section className="left card">
           <div className="mhead">
-            <div>
-              <h1>Bitcoin Up or Down - 5 Minutes</h1>
-              <div className="mute">{fmtWindow(startMs)}</div>
+            <div className="mtitle">
+              <div className="btc">₿</div>
+              <div>
+                <h1>BTC Up or Down 5m</h1>
+                <div className="mute">{fmtWindow(startMs)}</div>
+              </div>
             </div>
             <div className={`cd ${urgent ? "urgent" : ""}`}>
               <div className="box"><b>{mm}</b><span>MINS</span></div>
@@ -249,21 +287,26 @@ function App() {
 
           <div className="stats">
             <div>
-              <div className="mute sm">PRICE TO BEAT</div>
-              <div className="big">{ptb ? "$" + ptb.v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"}</div>
-              <div className="mute xs">{ptb ? ptb.src : "locking in…"}</div>
+              <div className="lab">Price To Beat</div>
+              <div className="big ptb">{ptb ? money(ptb.v) : "—"}</div>
+              {ptb && !ptb.exact && <div className="mute xs">{ptb.src}</div>}
+              {!ptb && <div className="mute xs">locking in…</div>}
             </div>
+            <div className="sep" />
             <div>
-              <div className="mute sm">CURRENT PRICE <span className={delta == null ? "" : delta >= 0 ? "g" : "r"}>{delta != null ? `${delta >= 0 ? "▲" : "▼"} $${Math.abs(delta).toFixed(2)}` : ""}</span></div>
-              <div className={`big ${delta == null ? "" : delta >= 0 ? "g" : "r"}`}>
-                {cur != null ? "$" + cur.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"}
+              <div className="lab orange">
+                Current Price{" "}
+                {delta != null && (
+                  <span className={delta >= 0 ? "g" : "r"}>{delta >= 0 ? "▲" : "▼"} ${Math.abs(delta).toFixed(0)}</span>
+                )}
               </div>
+              <div className="big orange">{cur != null ? money(cur) : "—"}</div>
               <div className="mute xs">{series.name}</div>
             </div>
           </div>
 
           <div className="chartwrap">
-            <Chart getSeries={pickSeries} getNow={syncedNow} startMs={startMs} endMs={endMs} ptb={ptb ? ptb.v : null} />
+            <Chart getSeries={pickSeries} getNow={syncedNow} ptb={ptb ? ptb.v : null} theme={theme} />
           </div>
           {!market && <div className="mute xs pad">Finding this window's market on Polymarket…</div>}
         </section>
