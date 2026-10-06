@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useServerClock, syncedNow } from "../lib/clock";
 import { usePriceFeeds } from "../lib/feeds";
 import { usePolyBook } from "../lib/book";
-import { fetchBinanceOpen, fetchEventBySlug, fetchOpenPrice, parseMarket, winnerOf } from "../lib/polymarket";
+import { fetchEventBySlug, parseMarket, winnerOf } from "../lib/polymarket";
 import { useStore } from "../lib/store";
 import { walkBuy, walkSell } from "../lib/engine";
 import { FILL_DELAY_MS, DEFAULT_BALANCE, TAKER_FEE_RATE, WINDOW_SEC } from "../lib/config";
@@ -28,13 +28,12 @@ function Dot({ ok }) {
 
 function App() {
   const now = useServerClock();
-  const { bin, cl, status } = usePriceFeeds();
-  const [mode, setMode] = useState("auto");
+  const { tw, status } = usePriceFeeds();
   const [showReset, setShowReset] = useState(false);
   const [customBal, setCustomBal] = useState("");
   const [toast, setToast] = useState(null);
   const [market, setMarket] = useState(null);
-  const [ptb, setPtb] = useState(null);
+  const [ptbLive, setPtbLive] = useState(null);
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem("polypaper-theme") || "dark"; } catch { return "dark"; }
   });
@@ -53,6 +52,7 @@ function App() {
   const startMs = ws * 1000;
   const endMs = startMs + WINDOW_SEC * 1000;
   const msLeft = Math.max(0, endMs - now);
+  const slug = `btc-updown-5m-${ws}`;
 
   // ---------- market discovery (cached + prefetches next window) ----------
   const mcache = useRef({});
@@ -87,77 +87,42 @@ function App() {
   // ---------- live order books ----------
   const { quotes, getBook, connected: clobLive } = usePolyBook(market?.upToken, market?.downToken);
 
-  // ---------- price series selection ----------
-  const pickSeries = useCallback(() => {
-    const n = syncedNow();
-    const c = cl.current;
-    const b = bin.current;
-    const clFresh = c.length && n - c[c.length - 1][0] < 6000;
-    if (mode === "chainlink") return { arr: c, name: "Chainlink" };
-    if (mode === "binance") return { arr: b, name: status.binName };
-    return clFresh ? { arr: c, name: "Chainlink" } : { arr: b, name: status.binName };
-  }, [mode, status.binName, bin, cl]);
-
-  const series = pickSeries();
-  const lastTick = series.arr[series.arr.length - 1];
+  // ---------- chart series: Polymarket's 60s TWAP price ----------
+  const pickSeries = useCallback(() => ({ arr: tw.current, name: "twap" }), [tw]);
+  const lastTick = tw.current[tw.current.length - 1];
   const cur = lastTick ? lastTick[1] : null;
 
-  // ---------- price to beat ----------
-  // 1) Polymarket's own open price (exact)  2) Chainlink tick at the window start
-  // 3) Binance candle open corrected by the live Binance↔Chainlink basis (approximate)
+  // ---------- price to beat: Gamma's eventMetadata.priceToBeat (what Polymarket's page shows) ----------
   useEffect(() => {
-    setPtb(null);
-    if (!market) return;
+    setPtbLive(market?.ptb ?? null);
+    if (!market || market.ptb != null) return;
     let dead = false;
     let timer;
-    let attempt = 0;
-    const nearTick = (arr) => {
-      let best = null;
-      let bd = 2500;
-      for (let i = arr.length - 1; i >= 0; i--) {
-        const d = Math.abs(arr[i][0] - startMs);
-        if (d < bd) { bd = d; best = arr[i][1]; }
-        if (arr[i][0] < startMs - 2500) break;
-      }
-      return best;
-    };
-    const put = (p) => setPtb((prev) => (prev && prev.exact ? prev : p));
-
-    const run = async () => {
-      if (attempt < 4 || attempt % 8 === 0) {
-        const ex = await fetchOpenPrice(ws);
-        if (dead) return true;
-        if (ex != null) { setPtb({ v: ex, src: "Polymarket", exact: true }); return true; }
-      }
-      if (market.ptb != null) { setPtb({ v: market.ptb, src: "Polymarket", exact: true }); return true; }
-
-      const v = nearTick(cl.current);
-      if (v != null) { put({ v, src: "≈ Chainlink tick at window start", exact: false }); return false; }
-
-      if (syncedNow() - startMs > 3000 && (attempt === 2 || attempt % 8 === 4)) {
-        const open = await fetchBinanceOpen(startMs);
-        if (dead) return true;
-        if (open != null) {
-          const c = cl.current;
-          const b = bin.current;
-          let adj = open;
-          if (c.length && b.length && Math.abs(c[c.length - 1][0] - b[b.length - 1][0]) < 3000) {
-            adj = open + (c[c.length - 1][1] - b[b.length - 1][1]); // remove the exchange basis
-          }
-          put({ v: adj, src: "≈ estimate (Binance open, Chainlink-adjusted)", exact: false });
-        }
-      }
-      return false;
-    };
-    const loop = async () => {
+    const poll = async () => {
       if (dead) return;
-      const done = await run();
-      attempt++;
-      if (!done && !dead && attempt < 60) timer = setTimeout(loop, attempt < 6 ? 800 : 4000);
+      try {
+        const m = parseMarket(await fetchEventBySlug(market.slug));
+        if (m && m.ptb != null) { if (!dead) setPtbLive(m.ptb); return; }
+      } catch {}
+      timer = setTimeout(poll, 1500);
     };
-    loop();
+    poll();
     return () => { dead = true; clearTimeout(timer); };
-  }, [market, ws, startMs, bin, cl]);
+  }, [market]);
+
+  // temporary stand-in only if Polymarket hasn't published it yet: our own TWAP at window start
+  let ptb = ptbLive != null ? { v: ptbLive, exact: true } : null;
+  if (!ptb && now - startMs > 8000) {
+    let best = null;
+    let bd = 3000;
+    const arr = tw.current;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const d = Math.abs(arr[i][0] - startMs);
+      if (d < bd) { bd = d; best = arr[i][1]; }
+      if (arr[i][0] < startMs - 3000) break;
+    }
+    if (best != null) ptb = { v: best, exact: false };
+  }
 
   // ---------- order execution ----------
   const ctx = useRef({});
@@ -207,11 +172,11 @@ function App() {
     const id = setInterval(async () => {
       const n = syncedNow();
       const slugs = [...new Set(useStore.getState().positions.filter((p) => p.endMs <= n).map((p) => p.slug))];
-      for (const slug of slugs) {
+      for (const sl of slugs) {
         try {
-          const ev = await fetchEventBySlug(slug);
+          const ev = await fetchEventBySlug(sl);
           const w = winnerOf(ev);
-          if (w) useStore.getState().settle(slug, w);
+          if (w) useStore.getState().settle(sl, w);
         } catch {}
       }
     }, 4000);
@@ -249,12 +214,8 @@ function App() {
           </div>
         </div>
         <div className="feeds">
-          <span><Dot ok={status.cl === "live"} /> Chainlink</span>
-          <span><Dot ok={status.bin === "live"} /> {status.binName}</span>
-          <span><Dot ok={clobLive} /> CLOB</span>
-          <button className="pill" onClick={() => setMode((m) => (m === "auto" ? "chainlink" : m === "chainlink" ? "binance" : "auto"))}>
-            Price: {mode}
-          </button>
+          <span><Dot ok={status.cl === "live"} /> Price feed</span>
+          <span><Dot ok={clobLive} /> Order book</span>
         </div>
         <div className="acct">
           <div>
@@ -289,7 +250,7 @@ function App() {
             <div>
               <div className="lab">Price To Beat</div>
               <div className="big ptb">{ptb ? money(ptb.v) : "—"}</div>
-              {ptb && !ptb.exact && <div className="mute xs">{ptb.src}</div>}
+              {ptb && !ptb.exact && <div className="mute xs">≈ estimate, updating…</div>}
               {!ptb && <div className="mute xs">locking in…</div>}
             </div>
             <div className="sep" />
@@ -301,7 +262,6 @@ function App() {
                 )}
               </div>
               <div className="big orange">{cur != null ? money(cur) : "—"}</div>
-              <div className="mute xs">{series.name}</div>
             </div>
           </div>
 
@@ -325,6 +285,23 @@ function App() {
       </main>
 
       <Drawer positions={positions} history={history} market={market} quotes={quotes} msLeft={msLeft} onOrder={onOrder} />
+
+      <section className="embed card">
+        <div className="etitle">
+          Polymarket's own widget for this window
+          <a href={`https://polymarket.com/event/${slug}`} target="_blank" rel="noopener noreferrer">View on Polymarket ↗</a>
+        </div>
+        <iframe
+          key={slug}
+          title={`Polymarket BTC Up or Down 5m (${slug})`}
+          src={`https://embed.polymarket.com/market?market=${slug}&height=300`}
+          width="400"
+          height="300"
+          frameBorder="0"
+          allowTransparency="true"
+          loading="lazy"
+        />
+      </section>
 
       {toast && <div className={`toast ${toast.ok ? "ok" : "bad"}`}>{toast.msg}</div>}
 
