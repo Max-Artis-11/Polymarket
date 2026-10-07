@@ -2,14 +2,13 @@
 import { useState } from "react";
 import { cents, fmtPnl, fmtUsd, fmtWindow } from "../lib/format";
 
-export default function Drawer({ positions, history, market, quotes, msLeft, onOrder }) {
+export default function Drawer({ positions, history, market, quotes, msLeft, onOrder, onCashout, resultOf }) {
   const [tab, setTab] = useState("pos");
   const [busyId, setBusyId] = useState(null);
 
-  const sell = async (p) => {
-    setBusyId(p.id);
-    await onOrder({ type: "sell", side: p.side, amount: p.shares, slug: p.slug, endMs: p.endMs });
-    setBusyId(null);
+  const run = async (id, fn) => {
+    setBusyId(id);
+    try { await fn(); } finally { setBusyId(null); }
   };
 
   return (
@@ -29,7 +28,19 @@ export default function Drawer({ positions, history, market, quotes, msLeft, onO
           {positions.length === 0 && <div className="empty">No open positions. Buy Up or Down to start.</div>}
           {positions.map((p) => {
             const live = p.slug === market?.slug && msLeft > 0;
-            const mark = live ? quotes[p.side].bid : null;
+            let mark = null;
+            let pending = false;
+            let note = null;
+            if (live) {
+              mark = quotes[p.side].bid;
+            } else {
+              const res = resultOf(p.windowStart);
+              if (res) {
+                mark = res.winner === p.side ? 1 : 0;
+                pending = !res.official;
+                note = `${res.winner} won${res.official ? "" : " · resolving"}`;
+              }
+            }
             const value = mark != null ? mark * p.shares : null;
             const pnl = value != null ? value - p.cost : null;
             return (
@@ -38,14 +49,27 @@ export default function Drawer({ positions, history, market, quotes, msLeft, onO
                 <span className={p.side === "Up" ? "g" : "r"}>{p.side}</span>
                 <span>{p.shares.toFixed(2)}</span>
                 <span>{cents(p.cost / p.shares)}</span>
-                <span>{live ? cents(mark) : "—"}</span>
+                <span>{mark != null ? cents(mark) : "—"}</span>
                 <span>{value != null ? fmtUsd(value) : "—"}</span>
-                <span className={pnl == null ? "" : pnl >= 0 ? "g" : "r"}>{pnl != null ? fmtPnl(pnl) : "Resolving…"}</span>
-                <span>
-                  {live && (
-                    <button className="mini" disabled={busyId === p.id} onClick={() => sell(p)}>
+                <span className={pnl == null ? "" : `${pnl >= 0 ? "g" : "r"}${pending ? " dim" : ""}`}>
+                  {pnl != null ? fmtPnl(pnl) : "—"}
+                </span>
+                <span className="acts">
+                  {live ? (
+                    <button
+                      className="mini"
+                      disabled={busyId === p.id}
+                      onClick={() => run(p.id, () => onOrder({ type: "sell", side: p.side, amount: p.shares, slug: p.slug, endMs: p.endMs }))}
+                    >
                       {busyId === p.id ? "…" : "Sell all"}
                     </button>
+                  ) : (
+                    <>
+                      <span className="resolving">{note || "Resolving…"}</span>
+                      <button className="mini warn" disabled={busyId === p.id} onClick={() => run(p.id, () => onCashout(p))}>
+                        {busyId === p.id ? "Selling…" : "Sell Now Anyway"}
+                      </button>
+                    </>
                   )}
                 </span>
               </div>
